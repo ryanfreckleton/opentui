@@ -339,7 +339,7 @@ pub const UnifiedTextBufferView = struct {
             .cached_line_vline_counts = &self.cached_line_vline_counts,
         };
 
-        // Call the generic calculation function
+        // Rebuild cached virtual lines with byte-accurate line starts.
         calculateVirtualLinesGeneric(
             true,
             self.text_buffer,
@@ -942,7 +942,7 @@ pub const UnifiedTextBufferView = struct {
         // Use width for wrap calculation
         const wrap_width_for_measure = if (self.wrap_mode != .none and width > 0) width else null;
 
-        // Call generic calculation with temporary structures
+        // Measure mode only needs widths and counts, so skip byte bookkeeping.
         calculateVirtualLinesGeneric(
             false,
             self.text_buffer,
@@ -972,7 +972,13 @@ pub const UnifiedTextBufferView = struct {
         return result;
     }
 
-    /// Generic virtual line calculation that writes to provided output structures
+    /// Builds virtual lines for wrapping, drawing, and measuring.
+    ///
+    /// `track_byte_starts=true` records UTF-8 byte starts in `cached_line_starts`.
+    /// The draw and edit paths need those byte offsets for cursor math and slicing.
+    ///
+    /// `track_byte_starts=false` records column starts only, and skips most byte
+    /// bookkeeping. `measureForDimensions()` uses this mode to avoid extra work.
     fn calculateVirtualLinesGeneric(
         comptime track_byte_starts: bool,
         text_buffer: *UnifiedTextBuffer,
@@ -987,9 +993,19 @@ pub const UnifiedTextBufferView = struct {
                 text_buffer: *UnifiedTextBuffer,
                 allocator: Allocator,
                 output: VirtualLineOutput,
+                // In no-wrap mode we can read byte starts from the first chunk for
+                // non-empty lines. Empty lines have no chunk, so we keep a small
+                // byte-start table for them.
                 line_start_bytes: []const u32 = &[_]u32{},
                 current_vline: ?VirtualLine = null,
 
+                /// Builds logical line-start byte offsets for no-wrap mode.
+                ///
+                /// We use this table for empty lines, because empty lines do not
+                /// have a first chunk to read `byte_start` from.
+                ///
+                /// The function returns a partial table on allocation failure.
+                /// Callers fall back to chunk-derived starts when needed.
                 fn buildLineStartByteOffsets(text_buffer_ctx: *UnifiedTextBuffer, allocator_ctx: Allocator) []const u32 {
                     var line_starts: std.ArrayListUnmanaged(u32) = .{};
                     line_starts.append(allocator_ctx, 0) catch return &[_]u32{};
@@ -1004,12 +1020,15 @@ pub const UnifiedTextBufferView = struct {
                     while (idx < written) {
                         const b = plain_text[idx];
                         if (b == '\n') {
+                            // `\n` always starts the next logical line.
                             idx += 1;
                             line_starts.append(allocator_ctx, @intCast(idx)) catch break;
                             continue;
                         }
 
                         if (b == '\r') {
+                            // Accept CRLF defensively, even though plain-text
+                            // extraction usually normalizes breaks to `\n`.
                             idx += 1;
                             if (idx < written and plain_text[idx] == '\n') {
                                 idx += 1;
@@ -1037,6 +1056,10 @@ pub const UnifiedTextBufferView = struct {
                     }
                 }
 
+                /// Returns the line start in bytes when the line has content.
+                ///
+                /// Empty lines have no first chunk, so callers should prefer the
+                /// precomputed `line_start_bytes` table for those lines.
                 fn line_start_byte_offset(line_info: iter_mod.LineInfo, vline: *const VirtualLine) u32 {
                     if (vline.chunks.items.len > 0) {
                         return vline.chunks.items[0].chunk.byte_start;
@@ -1058,6 +1081,8 @@ pub const UnifiedTextBufferView = struct {
                     vline.source_line = line_info.line_idx;
                     vline.source_col_offset = 0;
                     const line_start = if (track_byte_starts) blk: {
+                        // Non-empty lines can read byte_start from their first
+                        // chunk. Empty lines need the side table.
                         if (line_info.width_cols > 0) {
                             break :blk line_start_byte_offset(line_info, &vline);
                         }
@@ -1077,8 +1102,17 @@ pub const UnifiedTextBufferView = struct {
                 }
             };
 
+            var line_start_arena: std.heap.ArenaAllocator = undefined;
+            if (track_byte_starts) {
+                // We only need the lookup table during this function call. Keep
+                // its storage in a temporary arena so repeated cache rebuilds do
+                // not leak persistent allocations.
+                line_start_arena = std.heap.ArenaAllocator.init(allocator);
+                defer line_start_arena.deinit();
+            }
+
             const line_start_bytes = if (track_byte_starts)
-                Context.buildLineStartByteOffsets(text_buffer, allocator)
+                Context.buildLineStartByteOffsets(text_buffer, line_start_arena.allocator())
             else
                 &[_]u32{};
 
@@ -1100,7 +1134,10 @@ pub const UnifiedTextBufferView = struct {
                 output: VirtualLineOutput,
                 wrap_mode: WrapMode,
                 wrap_w: u32,
+                // Column counters drive wrapping and layout decisions.
                 global_char_offset: u32 = 0,
+                // Byte counters keep `cached_line_starts` byte-accurate when
+                // `track_byte_starts=true`.
                 current_byte_offset: u32 = 0,
                 line_start_byte_offset: u32 = 0,
                 line_idx: u32 = 0,
@@ -1111,16 +1148,26 @@ pub const UnifiedTextBufferView = struct {
                 current_line_first_vline_idx: u32 = 0,
                 current_line_vline_count: u32 = 0,
 
+                // Saved rollback point for word-wrap boundaries.
                 last_wrap_chunk_count: u32 = 0,
                 last_wrap_line_position: u32 = 0,
                 last_wrap_global_offset: u32 = 0,
                 last_wrap_byte_offset: u32 = 0,
+                // Word-wrap continuation lines drop leading spaces and tabs.
                 skip_leading_whitespace_after_wrap: bool = false,
 
+                /// Returns the smallest safe byte advance.
+                ///
+                /// This guarantees forward progress when wrap helpers report zero,
+                /// which prevents infinite loops on malformed input.
                 fn minByteAdvance(bytes: []const u8) u32 {
                     return @as(u32, @intCast(@min(@as(usize, 1), bytes.len)));
                 }
 
+                /// Returns the display width of the first grapheme at `byte_offset`.
+                ///
+                /// We call this when `findWrapPosByWidth` cannot fit anything on an
+                /// empty line. The forced width keeps wide graphemes and tabs intact.
                 fn firstGraphemeWidth(
                     chunk_bytes: []const u8,
                     byte_offset: u32,
@@ -1152,6 +1199,11 @@ pub const UnifiedTextBufferView = struct {
                     return 1;
                 }
 
+                /// Converts consumed columns back to consumed bytes.
+                ///
+                /// If the wrap helper already gave us a byte advance, we trust it.
+                /// In measure mode (`track_byte_starts=false`), we return zero
+                /// because callers do not need byte tracking there.
                 fn advanceBytesForColumns(
                     remaining_bytes: []const u8,
                     columns: u32,
@@ -1180,6 +1232,10 @@ pub const UnifiedTextBufferView = struct {
                     return minByteAdvance(remaining_bytes);
                 }
 
+                /// Maps a wrap boundary inside `to_add` columns to a byte offset.
+                ///
+                /// We store this byte offset as a rollback checkpoint when word-wrap
+                /// needs to split the current virtual line.
                 fn boundaryByteOffsetInChunk(
                     remaining_bytes_before_add: []const u8,
                     byte_offset_before_add: u32,
@@ -1221,6 +1277,12 @@ pub const UnifiedTextBufferView = struct {
                     return byte_offset_before_add + minByteAdvance(remaining_bytes_before_add);
                 }
 
+                /// Finalizes the current virtual line and starts the next one.
+                ///
+                /// Side effects:
+                /// - Appends one entry to all output caches.
+                /// - Resets wrap rollback checkpoints.
+                /// - Moves `line_col_offset` to the next source-column position.
                 fn commitVirtualLine(wctx: *@This()) void {
                     wctx.current_vline.width_cols = wctx.line_position;
                     wctx.current_vline.source_line = wctx.line_idx;
@@ -1250,6 +1312,10 @@ pub const UnifiedTextBufferView = struct {
                     wctx.last_wrap_byte_offset = 0;
                 }
 
+                /// Adds chunk width to the current virtual line.
+                ///
+                /// In measure mode we skip storing `VirtualChunk` records, because
+                /// the caller only needs widths and counts.
                 fn addVirtualChunk(wctx: *@This(), chunk: *const TextChunk, _: u32, start: u32, width_param: u32) void {
                     if (track_byte_starts) {
                         wctx.current_vline.chunks.append(wctx.allocator, VirtualChunk{
@@ -1267,12 +1333,17 @@ pub const UnifiedTextBufferView = struct {
                     wctx.chunk_idx_in_line = chunk_idx_in_line;
 
                     if (track_byte_starts and wctx.current_vline.chunks.items.len == 0 and wctx.line_position == 0) {
+                        // Keep byte counters aligned with the first chunk in the
+                        // visual line before we consume any columns.
                         wctx.current_byte_offset = chunk.byte_start;
                         wctx.line_start_byte_offset = chunk.byte_start;
                     }
 
                     if (wctx.wrap_mode == .word) {
                         const chunk_bytes = chunk.getBytes(wctx.text_buffer.memRegistry());
+                        // Wrap-break caches are generated with unicode semantics.
+                        // When the caller selects wcwidth, we still use unicode for
+                        // wrap boundary math so cached break offsets stay consistent.
                         const wrap_width_method: utf8.WidthMethod = switch (wctx.text_buffer.widthMethod()) {
                             .wcwidth => .unicode,
                             else => wctx.text_buffer.widthMethod(),
@@ -1286,9 +1357,9 @@ pub const UnifiedTextBufferView = struct {
                         var grapheme_idx: usize = 0;
                         var col_delta: i64 = 0;
 
-                        // char_offset tracks COLUMN position within the chunk (not grapheme count)
-                        // chunk.width is also in columns. The loop processes the chunk column by column.
-                        var char_offset: u32 = 0; // Column offset within chunk
+                        // `char_offset` and `chunk.width` are both measured in
+                        // display columns, not grapheme count.
+                        var char_offset: u32 = 0;
                         var byte_offset: u32 = 0;
                         var wrap_idx: usize = 0;
 
@@ -1296,6 +1367,8 @@ pub const UnifiedTextBufferView = struct {
                             const remaining_in_chunk = chunk.width - char_offset;
                             const remaining_on_line = if (wctx.line_position < wctx.wrap_w) wctx.wrap_w - wctx.line_position else 0;
 
+                            // Word wrap drops leading spaces and tabs on the next
+                            // visual line, which matches editor behavior.
                             if (wctx.skip_leading_whitespace_after_wrap and wctx.line_position == 0 and byte_offset < chunk_bytes.len) {
                                 const next_byte = chunk_bytes[byte_offset];
                                 if (next_byte == ' ' or next_byte == '\t') {
@@ -1432,6 +1505,9 @@ pub const UnifiedTextBufferView = struct {
                                 }
                             } else if (wctx.last_wrap_chunk_count > 0) {
                                 if (!track_byte_starts) {
+                                    // Measure mode does not keep chunk slices, so it
+                                    // cannot rewind chunk arrays. We still split at
+                                    // the saved boundary by moving width counters.
                                     const carried_width = wctx.line_position - wctx.last_wrap_line_position;
                                     wctx.line_position = wctx.last_wrap_line_position;
                                     wctx.global_char_offset = wctx.last_wrap_global_offset;
@@ -1471,6 +1547,9 @@ pub const UnifiedTextBufferView = struct {
                                     chunks_to_move_count += 1;
                                 }
 
+                                // Copy suffix chunks before commit, then restore
+                                // them onto the next visual line. If allocation
+                                // fails, we still commit and continue without panic.
                                 const saved_chunks_result = wctx.allocator.alloc(VirtualChunk, chunks_to_move_count);
                                 if (saved_chunks_result) |saved_chunks| {
                                     var saved_idx: usize = 0;
@@ -1518,6 +1597,8 @@ pub const UnifiedTextBufferView = struct {
                                 }
 
                                 if (wctx.skip_leading_whitespace_after_wrap and byte_offset < chunk_bytes.len) {
+                                    // Apply the same whitespace-drop rule after we
+                                    // flush a line mid-chunk.
                                     while (byte_offset < chunk_bytes.len and (chunk_bytes[byte_offset] == ' ' or chunk_bytes[byte_offset] == '\t')) {
                                         const drop_cols: u32 = if (chunk_bytes[byte_offset] == '\t')
                                             @as(u32, wctx.text_buffer.tabWidth())
@@ -1727,6 +1808,8 @@ pub const UnifiedTextBufferView = struct {
                 fn line_end_callback(ctx_ptr: *anyopaque, line_info: iter_mod.LineInfo) void {
                     const wctx = @as(*@This(), @ptrCast(@alignCast(ctx_ptr)));
 
+                    // In measure mode we do not store chunks, so content checks
+                    // must use width state instead of `chunks.items.len`.
                     const has_content = if (track_byte_starts)
                         wctx.current_vline.chunks.items.len > 0
                     else
